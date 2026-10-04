@@ -1,0 +1,21 @@
+# Local environments and dependencies
+.venv/
+venv/
+env/
+node_modules/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Generated files and operating-system metadata
+__pycache__/
+*.py[cod]
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editor settings
+.vscode/
+.idea/

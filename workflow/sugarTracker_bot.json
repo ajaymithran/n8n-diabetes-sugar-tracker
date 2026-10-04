@@ -1,0 +1,648 @@
+{
+  "name": "sugarTracker_bot",
+  "nodes": [
+    {
+      "parameters": {
+        "updates": [
+          "message"
+        ],
+        "additionalFields": {}
+      },
+      "id": "7ec88051-aba1-45b1-871e-1e076c1a777d",
+      "name": "Telegram Trigger",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.5,
+      "position": [
+        -160,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "value": "REDACTED_DATA_TABLE_ID",
+          "mode": "list",
+          "cachedResultName": "REDACTED_DATA_TABLE"
+        },
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "chatid",
+              "keyValue": "={{ String($json.message.chat.id) }}"
+            }
+          ]
+        }
+      },
+      "id": "8b88c4cf-b890-4cd3-a570-d259ccb064e3",
+      "name": "Get Chat State",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        128,
+        144
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "text": "={{ $('Telegram Trigger').item.json.message.text }}",
+        "attributes": {
+          "attributes": [
+            {
+              "name": "sugar",
+              "type": "number",
+              "description": "The blood glucose reading in mg/dL exactly as written by the patient. Return null if the message contains no glucose number. Never guess a number."
+            },
+            {
+              "name": "measurement",
+              "description": "One of: Fasting, Before Meal, After Meal, Random, Other. Fasting means empty stomach or morning before eating. Before breakfast/lunch/dinner is Before Meal. After or post breakfast/lunch/dinner is After Meal. Bedtime is Other. Return an empty string if the patient did not say."
+            },
+            {
+              "name": "notes",
+              "description": "Any extra detail besides the number and measurement type, such as how the patient felt or what they ate. Empty string if none."
+            },
+            {
+              "name": "reading_date",
+              "description": "Date of the reading in YYYY-MM-DD, only if the patient explicitly mentioned a date. Empty string otherwise."
+            },
+            {
+              "name": "reading_time",
+              "description": "Time of the reading in 24-hour HH:mm, only if the patient explicitly mentioned a time. Empty string otherwise."
+            }
+          ]
+        },
+        "options": {
+          "systemPromptTemplate": "=You extract blood sugar readings from short chat messages written by a diabetic patient.\nToday's date is {{ $now.setZone('Asia/Kolkata').toFormat('yyyy-MM-dd') }}.\nOnly extract what the patient actually wrote. If a value is not mentioned, leave it empty or null.\nDo not give medical advice or interpret the reading."
+        }
+      },
+      "id": "57e16e7d-2b77-4819-93b5-e598866759d4",
+      "name": "Information Extractor",
+      "type": "@n8n/n8n-nodes-langchain.informationExtractor",
+      "typeVersion": 1.2,
+      "position": [
+        352,
+        144
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-flash-lite-latest",
+        "options": {
+          "temperature": 0
+        }
+      },
+      "id": "6bbcf91e-4bbb-417f-8cb1-86f6609e39a2",
+      "name": "Google Gemini Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1.2,
+      "position": [
+        432,
+        384
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Combines this message with any saved conversation state, validates it,\n// and decides what happens next: complete, need_info, invalid or unclear.\nconst msg = $('Telegram Trigger').first().json.message || {};\nconst text = String(msg.text || '').trim();\nconst lower = text.toLowerCase();\nconst hasWords = /[a-z]/i.test(text);\nconst chatId = String((msg.chat || {}).id || '');\n\nconst stateRow = $('Get Chat State').first().json || {};\nconst state = stateRow.waiting_for ? stateRow : {};\nconst ext = ($input.first().json || {}).output || {};\n\nconst TYPES = ['Fasting', 'Before Meal', 'After Meal', 'Random', 'Other'];\n\nfunction normMeasurement(value) {\n  const s = String(value || '').toLowerCase().trim();\n  if (!s) return '';\n  for (const t of TYPES) { if (s === t.toLowerCase()) return t; }\n  if (/\\b(after|post)\\b|\\bpp\\b|postprandial/.test(s)) return 'After Meal';\n  if (/\\b(before|pre)\\b/.test(s)) return 'Before Meal';\n  if (/\\bfast(ing|ed)?\\b|empty stomach/.test(s)) return 'Fasting';\n  if (/\\brandom\\b/.test(s)) return 'Random';\n  if (/\\b(bedtime|bed time|night|other)\\b/.test(s)) return 'Other';\n  return '';\n}\n\nlet measNew = '';\nlet sugarNew = null;\nconst choice = text.match(/^([1-4])\\s*\\uFE0F?\\u20E3?$/);\nif (state.waiting_for === 'measurement' && choice) {\n  // Patient answered the type question with a number 1-4\n  measNew = TYPES[Number(choice[1]) - 1];\n} else {\n  const numbers = (text.match(/\\d+(\\.\\d+)?/g) || []).map(Number);\n  const extSugar = Number(ext.sugar);\n  const extHasSugar = ext.sugar !== null && ext.sugar !== undefined && ext.sugar !== '' && isFinite(extSugar);\n  if (extHasSugar && numbers.includes(extSugar)) {\n    sugarNew = extSugar; // only trust numbers that really appear in the message\n  } else if (numbers.length === 1) {\n    sugarNew = numbers[0];\n  }\n  measNew = normMeasurement(text) || (hasWords ? normMeasurement(ext.measurement) : '');\n}\n\nconst savedSugar = (state.sugar === null || state.sugar === undefined || state.sugar === '') ? null : Number(state.sugar);\nconst sugar = sugarNew !== null ? sugarNew : savedSugar;\nconst measurement = measNew || state.measurement || '';\n\nconst extNotes = hasWords ? String(ext.notes || '').trim() : '';\nlet noteNew = extNotes;\nif (!noteNew && sugarNew !== null && text.split(/\\s+/).length > 4) noteNew = 'Original message: ' + text;\nconst notes = [state.notes, noteNew].filter(Boolean).join(' | ');\n\nlet when = $now.setZone('Asia/Kolkata');\nif (/\\byesterday\\b/.test(lower)) when = when.minus({ days: 1 });\nconst d = String(ext.reading_date || '');\nif (/\\d{1,2}[\\/.-]\\d{1,2}|\\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\\b/.test(lower) && /^\\d{4}-\\d{2}-\\d{2}$/.test(d)) {\n  const p = DateTime.fromISO(d, { zone: 'Asia/Kolkata' });\n  if (p.isValid) when = when.set({ year: p.year, month: p.month, day: p.day });\n}\nconst t = String(ext.reading_time || '');\nif (/\\d{1,2}(:\\d{2})?\\s*(am|pm)\\b|\\b\\d{1,2}:\\d{2}\\b/.test(lower) && /^\\d{1,2}:\\d{2}$/.test(t)) {\n  const hm = t.split(':').map(Number);\n  if (hm[0] < 24 && hm[1] < 60) when = when.set({ hour: hm[0], minute: hm[1] });\n}\n\nlet status = 'unclear';\nlet waitingFor = '';\nlet question = '';\nif (sugarNew !== null && (sugarNew < 20 || sugarNew > 1000)) {\n  status = 'invalid';\n} else if (sugar !== null && measurement) {\n  status = 'complete';\n} else if (sugar !== null) {\n  status = 'need_info';\n  waitingFor = 'measurement';\n  question = 'Got it: ' + sugar + ' mg/dL.\\nWas this reading fasting, before a meal, after a meal, or random?';\n} else if (measurement) {\n  status = 'need_info';\n  waitingFor = 'sugar';\n  question = 'Got it: ' + measurement + '.\\nWhat was your blood sugar reading in mg/dL?';\n}\n\nreturn [{ json: {\n  chat_id: chatId,\n  status: status,\n  waiting_for: waitingFor,\n  question: question,\n  sugar: sugar,\n  measurement: measurement,\n  notes: notes,\n  date: when.toFormat('dd-MM-yyyy'),\n  time: when.toFormat('hh:mm a'),\n  message_text: text\n} }];"
+      },
+      "id": "71dced14-eb63-4a5e-a9fa-36f0d1d7855e",
+      "name": "Combine Reading",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        704,
+        144
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.status }}",
+                    "rightValue": "complete",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "3407b65d-9930-4e32-b20b-d149353444d4"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Complete"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.status }}",
+                    "rightValue": "need_info",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "e4152b10-7b91-480d-a627-9b6d0c5ecf24"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Missing info"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.status }}",
+                    "rightValue": "invalid",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "df0ae584-26ec-4d07-898f-d1b7e4f5922b"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Invalid number"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "Unclear"
+        }
+      },
+      "id": "2eac4b94-8657-4de3-95ac-1c593cfb0f84",
+      "name": "Check Missing Data",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        928,
+        112
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Combine Reading').item.json.chat_id }}",
+        "text": "=✅ Sugar reading saved.\n\nSugar: {{ $('Combine Reading').item.json.sugar }} mg/dL\nMeasurement: {{ $('Combine Reading').item.json.measurement }}\nDate: {{ $('Combine Reading').item.json.date }}\nTime: {{ $('Combine Reading').item.json.time }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "a789ae74-cf94-43f0-b74d-fdd6db001a03",
+      "name": "Send Confirmation",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1264,
+        -336
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "REDACTED_SHEET_ID",
+          "mode": "list",
+          "cachedResultName": "REDACTED_SHEET"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "Sheet1"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "DATE": "={{ $('Combine Reading').item.json.date }}",
+            "TIME": "={{ $('Combine Reading').item.json.time }}",
+            "MEASUREMENT": "={{ $('Combine Reading').item.json.measurement }}",
+            "SUGAR(mg/dL)": "={{ $('Combine Reading').item.json.sugar }}",
+            "notes": "={{ $('Combine Reading').item.json.notes }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "DATE",
+              "displayName": "DATE",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "TIME",
+              "displayName": "TIME",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "MEASUREMENT",
+              "displayName": "MEASUREMENT",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "SUGAR(mg/dL)",
+              "displayName": "SUGAR(mg/dL)",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "notes",
+              "displayName": "notes",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "c5fdfadf-cc20-4eb2-830f-42745629c768",
+      "name": "Append row in sheet",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        1488,
+        -336
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "deleteRows",
+        "dataTableId": {
+          "__rl": true,
+          "value": "REDACTED_DATA_TABLE_ID",
+          "mode": "list",
+          "cachedResultName": "REDACTED_DATA_TABLE"
+        },
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "chatid",
+              "keyValue": "={{ $('Combine Reading').item.json.chat_id }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "22c5c37e-7c6e-42c3-92c1-c411056bb57b",
+      "name": "Clear Chat State",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1712,
+        -336
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "upsert",
+        "dataTableId": {
+          "__rl": true,
+          "value": "REDACTED_DATA_TABLE_ID",
+          "mode": "list",
+          "cachedResultName": "REDACTED_DATA_TABLE"
+        },
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "chatid",
+              "keyValue": "={{ $json.chat_id }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "chatid": "={{ $json.chat_id }}",
+            "waiting_for": "={{ $json.waiting_for }}",
+            "sugar": "={{ $json.sugar }}",
+            "measurement": "={{ $json.measurement }}",
+            "notes": "={{ $json.notes }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "chatid",
+              "displayName": "chatid",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "waiting_for",
+              "displayName": "waiting_for",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "sugar",
+              "displayName": "sugar",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "measurement",
+              "displayName": "measurement",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "notes",
+              "displayName": "notes",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "7d833da9-f051-4276-9ba8-51efe711c5c1",
+      "name": "Save Chat State",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1376,
+        112
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Combine Reading').item.json.chat_id }}",
+        "text": "={{ $('Combine Reading').item.json.question }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "736fb1ca-c363-46e0-8674-651373e5ddf8",
+      "name": "Ask For Missing Info",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1600,
+        112
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.chat_id }}",
+        "text": "That number does not look like a blood sugar reading in mg/dL. Please check it and send it again, for example: '128 fasting'.",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "9cc7fa91-eee0-47f1-8999-fc718397e871",
+      "name": "Reply Invalid Number",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1488,
+        576
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.chat_id }}",
+        "text": "I couldn't understand the sugar reading. Please send something like:\n'128 fasting'\nor\n'My sugar is 145 after lunch'.",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "088e6a2a-e26b-45ad-9b87-8408e1051d9e",
+      "name": "Reply Unclear",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1488,
+        384
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Telegram Trigger": {
+      "main": [
+        [
+          {
+            "node": "Get Chat State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Chat State": {
+      "main": [
+        [
+          {
+            "node": "Information Extractor",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Information Extractor": {
+      "main": [
+        [
+          {
+            "node": "Combine Reading",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Information Extractor",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Combine Reading": {
+      "main": [
+        [
+          {
+            "node": "Check Missing Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Missing Data": {
+      "main": [
+        [
+          {
+            "node": "Send Confirmation",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Save Chat State",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reply Invalid Number",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reply Unclear",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Confirmation": {
+      "main": [
+        [
+          {
+            "node": "Append row in sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Append row in sheet": {
+      "main": [
+        [
+          {
+            "node": "Clear Chat State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Chat State": {
+      "main": [
+        [
+          {
+            "node": "Ask For Missing Info",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "REDACTED_VERSION_ID",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "REDACTED_INSTANCE_ID"
+  },
+  "nodeGroups": [
+    {
+      "id": "c3d858ec-150e-4a9c-b693-30fe985948f6",
+      "name": "Understand the message",
+      "nodeIds": [
+        "8b88c4cf-b890-4cd3-a570-d259ccb064e3",
+        "57e16e7d-2b77-4819-93b5-e598866759d4",
+        "6bbcf91e-4bbb-417f-8cb1-86f6609e39a2",
+        "71dced14-eb63-4a5e-a9fa-36f0d1d7855e",
+        "2eac4b94-8657-4de3-95ac-1c593cfb0f84"
+      ],
+      "description": "Loads any half-finished reading for this chat, reads the new message with AI, merges both and decides what is still missing"
+    },
+    {
+      "id": "88c4bc75-b2f4-48ba-8761-6a0bcb30cd0f",
+      "name": "Save complete reading",
+      "nodeIds": [
+        "a789ae74-cf94-43f0-b74d-fdd6db001a03",
+        "c5fdfadf-cc20-4eb2-830f-42745629c768",
+        "22c5c37e-7c6e-42c3-92c1-c411056bb57b"
+      ],
+      "description": "Confirms the finished reading to the patient, adds it to the sugar sheet, then forgets the saved conversation"
+    },
+    {
+      "id": "4431bd33-2368-41f4-b170-7d3ded77ec6c",
+      "name": "Ask for missing details",
+      "nodeIds": [
+        "7d833da9-f051-4276-9ba8-51efe711c5c1",
+        "736fb1ca-c363-46e0-8674-651373e5ddf8"
+      ],
+      "description": "Remembers what the patient already gave, then asks only for the sugar value or the reading type that is missing"
+    }
+  ],
+  "id": "REDACTED_WORKFLOW_ID",
+  "tags": []
+}
